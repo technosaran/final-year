@@ -1,55 +1,155 @@
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
-import re
-from typing import List, Dict
+"""
+AI Summary Service - Production-ready ML service with async support
+"""
+import asyncio
+import time
+from typing import List, Dict, Optional, Tuple
 import logging
+import re
+from concurrent.futures import ThreadPoolExecutor
+
+from config import settings
+from utils import run_in_thread, clean_text
+from schemas import EmailTask, SummarizationResponse, TaskExtractionResponse
 
 logger = logging.getLogger(__name__)
 
+# Thread pool for CPU-bound ML operations
+ml_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ml_worker")
+
+
 class AISummaryService:
+    """Production AI service with proper error handling and async support"""
+    
     def __init__(self):
         """Initialize AI models for summarization and task extraction"""
+        self.summarizer = None
+        self.classifier = None
+        self._models_loaded = False
+        self._loading = False
+        
+        # Start loading models in background
+        asyncio.create_task(self._load_models_async())
+    
+    async def _load_models_async(self):
+        """Load AI models asynchronously to avoid blocking startup"""
+        if self._loading or self._models_loaded:
+            return
+        
+        self._loading = True
+        try:
+            logger.info("Loading AI models in background...")
+            
+            # Load models in thread pool to avoid blocking
+            await asyncio.get_event_loop().run_in_executor(
+                ml_executor, self._load_models_sync
+            )
+            
+            self._models_loaded = True
+            logger.info("AI models loaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to load AI models: {e}")
+            # Continue without models - graceful degradation
+        finally:
+            self._loading = False
+    
+    def _load_models_sync(self):
+        """Synchronous model loading (runs in thread pool)"""
         try:
             # Use BART for summarization (free, offline)
+            from transformers import pipeline
             self.summarizer = pipeline(
                 "summarization", 
-                model="facebook/bart-large-cnn",
-                device=-1  # Use CPU (free)
+                model=settings.summarization_model,
+                device=-1,  # Use CPU (free)
+                model_kwargs={"cache_dir": settings.ai_model_cache_dir}
             )
             
             # Use sentence transformers for classification
             from sentence_transformers import SentenceTransformer
-            self.classifier = SentenceTransformer('all-MiniLM-L6-v2')
+            self.classifier = SentenceTransformer(
+                settings.classification_model,
+                cache_folder=settings.ai_model_cache_dir
+            )
             
-            logger.info("AI models loaded successfully")
+        except ImportError as e:
+            logger.error(f"Missing ML dependencies: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Failed to load AI models: {e}")
-            self.summarizer = None
-            self.classifier = None
+            logger.error(f"Model loading error: {e}")
+            raise
 
-    def summarize_text(self, text: str, max_length: int = 150) -> str:
-        """Summarize text using BART model"""
-        if not self.summarizer or not text.strip():
-            return text[:200] + "..." if len(text) > 200 else text
+    @run_in_thread
+    def _summarize_sync(self, text: str, max_length: int, min_length: int) -> Dict:
+        """Synchronous summarization (runs in thread pool)"""
+        if not self.summarizer:
+            raise RuntimeError("Summarizer model not loaded")
+        
+        return self.summarizer(
+            text,
+            max_length=max_length,
+            min_length=min_length,
+            do_sample=False
+        )
+    
+    async def summarize_text(self, text: str, max_length: int = 150) -> SummarizationResponse:
+        """Summarize text using BART model with async support"""
+        start_time = time.time()
+        
+        if not text or not text.strip():
+            return SummarizationResponse(
+                summary="",
+                confidence_score=0.0,
+                processing_time=0.0
+            )
         
         try:
             # Clean and prepare text
-            cleaned_text = self._clean_text(text)
+            cleaned_text = clean_text(text)
             
             if len(cleaned_text) < 50:  # Too short to summarize
-                return cleaned_text
+                return SummarizationResponse(
+                    summary=cleaned_text,
+                    confidence_score=1.0,
+                    processing_time=time.time() - start_time
+                )
             
-            # Generate summary
-            summary = self.summarizer(
-                cleaned_text, 
-                max_length=max_length, 
-                min_length=30, 
-                do_sample=False
+            # Ensure models are loaded
+            if not self._models_loaded:
+                await self._load_models_async()
+            
+            if not self.summarizer:
+                # Graceful fallback
+                fallback_summary = cleaned_text[:max_length] + "..." if len(cleaned_text) > max_length else cleaned_text
+                return SummarizationResponse(
+                    summary=fallback_summary,
+                    confidence_score=0.5,
+                    processing_time=time.time() - start_time
+                )
+            
+            # Generate summary asynchronously
+            min_length = min(30, len(cleaned_text) // 4)
+            result = await self._summarize_sync(cleaned_text, max_length, min_length)
+            
+            summary_text = result[0]['summary_text']
+            confidence = result[0].get('score', 0.8)  # Default confidence
+            
+            return SummarizationResponse(
+                summary=summary_text,
+                confidence_score=confidence,
+                processing_time=time.time() - start_time
             )
             
-            return summary[0]['summary_text']
         except Exception as e:
             logger.error(f"Summarization failed: {e}")
-            return text[:200] + "..." if len(text) > 200 else text
+            # Graceful fallback
+            fallback_summary = text[:max_length] + "..." if len(text) > max_length else text
+            return SummarizationResponse(
+                summary=fallback_summary,
+                confidence_score=0.0,
+                processing_time=time.time() - start_time
+            )
 
     def extract_tasks(self, text: str) -> List[str]:
         """Extract actionable tasks from text"""
